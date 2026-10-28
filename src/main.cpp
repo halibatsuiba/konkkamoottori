@@ -60,13 +60,41 @@ HardwareSerial servoUart(1);
 // The Grove OLED (SSD1308) is driven with the compatible SSD1306 driver.
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, OLED_SCL_PIN, OLED_SDA_PIN);
 
-void showStatus(const String& line1, const String& line2 = "", const String& line3 = "",
-                const String& line4 = "") {
+bool motorOk = false;
+
+void drawWifiLogo(int centerX, int baseY) {
+  oled.drawDisc(centerX, baseY, 1);
+  for (int radius = 3; radius <= 9; radius += 3) {
+    for (int degrees = -45; degrees <= 45; ++degrees) {
+      const float angle = degrees * PI / 180.0f;
+      oled.drawPixel(centerX + lroundf(radius * sinf(angle)), baseY - lroundf(radius * cosf(angle)));
+    }
+  }
+}
+
+// Motor icon: body with a front flange and a shaft.
+void drawMotorIcon(int x, int y) {
+  oled.drawFrame(x, y + 1, 9, 9);
+  oled.drawBox(x + 9, y + 2, 1, 7);
+  oled.drawBox(x + 10, y + 4, 4, 3);
+}
+
+// Line 1 is the status line: title, motor icon and Wi-Fi logo. The last row shows the latest Wi-Fi command.
+String lastCommand;
+
+void showStatus(const String& line1 = "", const String& line2 = "", const String& line3 = "") {
   oled.clearBuffer();
-  oled.setFont(u8g2_font_6x12_tf);
-  const String* lines[] = {&line1, &line2, &line3, &line4};
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawUTF8(0, 10, "Seponpyöritin");
+  if (motorOk) {
+    drawMotorIcon(88, 0);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    drawWifiLogo(116, 9);
+  }
+  const String* lines[] = {&line1, &line2, &line3, &lastCommand};
   for (int i = 0; i < 4; ++i) {
-    oled.drawStr(0, 12 + i * 16, lines[i]->c_str());
+    oled.drawUTF8(0, 24 + i * 12, lines[i]->c_str());
   }
   oled.sendBuffer();
 }
@@ -203,7 +231,8 @@ bool sendServoCommand(uint8_t* command, size_t length, uint8_t& result) {
   size_t received = 0;
   const uint32_t started = millis();
   uint32_t lastByteAt = started;
-  while (received < sizeof(response) && millis() - started < 1500) {
+  const size_t expected = SERVO_HAS_CHECKSUM ? sizeof(response) : 2;
+  while (received < expected && millis() - started < 1500) {
     if (servoUart.available() > 0) {
       response[received++] = static_cast<uint8_t>(servoUart.read());
       lastByteAt = millis();
@@ -267,6 +296,7 @@ bool sendMoveCommand(uint32_t pulses, bool reverse, uint8_t speed, uint8_t& resu
 }
 
 void handleMove() {
+  const uint32_t handlerStart = millis();
   if (!requireAuthentication()) {
     return;
   }
@@ -293,19 +323,21 @@ void handleMove() {
   }
 
   uint8_t motorResult = 0;
-  const String moveSummary = String(pulses) + (direction == "reverse" ? " rev" : " fwd") + " s" + speed;
+  lastCommand = "Cmd: Move " + String(pulses) + (direction == "reverse" ? " rev" : " fwd") + " s" + speed;
   if (!sendMoveCommand(pulses, direction == "reverse", static_cast<uint8_t>(speed), motorResult)) {
-    showStatus("Move failed", moveSummary, "No servo reply", WiFi.localIP().toString());
+    showStatus("Move failed: no reply", WiFi.localIP().toString());
     sendJsonError(502, "No valid response from the SERVO42C. Check UART wiring, baud rate, address, and CR_UART mode.");
     return;
   }
   if (motorResult != 0x01) {
-    showStatus("Move rejected", moveSummary, "", WiFi.localIP().toString());
+    showStatus("Move rejected", WiFi.localIP().toString());
     sendJsonError(502, "The SERVO42C rejected the move command.");
     return;
   }
 
-  showStatus("Move accepted", moveSummary, "", WiFi.localIP().toString());
+  showStatus("Move accepted", WiFi.localIP().toString());
+  Serial.printf("Move handled in %lu ms (RSSI %d dBm)\n", static_cast<unsigned long>(millis() - handlerStart),
+                WiFi.RSSI());
   server.send(200, "application/json", "{\"message\":\"Move command accepted by the SERVO42C.\"}");
 }
 
@@ -317,13 +349,13 @@ bool enableServo() {
 
 void sendServoResult(bool replied, uint8_t result, const char* okMessage, const char* action) {
   if (!replied) {
-    showStatus(String(action) + " failed", "No servo reply", "", WiFi.localIP().toString());
+    showStatus(String(action) + " failed: no reply", WiFi.localIP().toString());
     sendJsonError(502, "No valid response from the SERVO42C. Check UART wiring, baud rate, address, and CR_UART mode.");
   } else if (result != 0x01) {
-    showStatus(String(action) + " rejected", "", "", WiFi.localIP().toString());
+    showStatus(String(action) + " rejected", WiFi.localIP().toString());
     sendJsonError(502, "The SERVO42C rejected the command.");
   } else {
-    showStatus(String(action) + " accepted", "", "", WiFi.localIP().toString());
+    showStatus(String(action) + " accepted", WiFi.localIP().toString());
     String body = "{\"message\":\"";
     body += okMessage;
     body += "\"}";
@@ -351,6 +383,7 @@ void handleRun() {
       SERVO_ADDRESS, 0xF6,
       static_cast<uint8_t>((direction == "reverse" ? 0x80 : 0x00) | speed), 0};
   uint8_t result = 0;
+  lastCommand = "Cmd: Run " + String(direction == "reverse" ? "rev" : "fwd") + " s" + speed;
   const bool replied = enableServo() && sendServoCommand(command, sizeof(command), result);
   sendServoResult(replied, result, "Running continuously. Press Stop to halt.", "Run");
 }
@@ -361,6 +394,7 @@ void handleStop() {
   }
   uint8_t command[] = {SERVO_ADDRESS, 0xF7, 0};
   uint8_t result = 0;
+  lastCommand = "Cmd: Stop";
   const bool replied = sendServoCommand(command, sizeof(command), result);
   sendServoResult(replied, result, "Stop command accepted by the SERVO42C.", "Stop");
 }
@@ -387,14 +421,16 @@ void startServerIfConnected() {
   serverStarted = true;
   Serial.println(i2cScanResult);
   Serial.print("Connected. Controller ready at http://");
-  Serial.println(WiFi.localIP());
-  showStatus("Servo42C controller", "Wi-Fi connected", "Open in browser:", WiFi.localIP().toString());
+  showStatus(WiFi.localIP().toString());
+  Serial.println(i2cScanResult);
 }
 
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
+  // Without a terminal attached, USB CDC writes would block; drop the output instead.
+  Serial.setTxTimeoutMs(0);
   const uint32_t serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) {
     delay(10);
@@ -417,10 +453,17 @@ void setup() {
   Serial.println(i2cScanResult);
   oled.setI2CAddress(0x3C << 1);
   oled.begin();
-  showStatus("Servo42C controller", "Booting...");
+  showStatus("Booting...");
+
+  // Read-only enable-status query: it does not move or enable the motor.
+  uint8_t statusCommand[] = {SERVO_ADDRESS, 0x3A, 0};
+  uint8_t statusResult = 0;
+  motorOk = sendServoCommand(statusCommand, sizeof(statusCommand), statusResult);
+  Serial.println(motorOk ? "Motor: OK" : "Motor: Error");
+  showStatus("Booting...");
 
   if (!hasNetworkSettings()) {
-    showStatus("Servo42C controller", "No Wi-Fi settings", "Edit wifi_config.h");
+    showStatus("No Wi-Fi settings", "Edit wifi_config.h");
     Serial.println("Wi-Fi/controller credentials are not configured.");
     Serial.println("Copy include/wifi_config.example.h to include/wifi_config.h and set all four values.");
     return;
@@ -434,7 +477,7 @@ void setup() {
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWifiAttempt = millis();
-  showStatus("Servo42C controller", "Connecting to Wi-Fi", WIFI_SSID);
+  showStatus("Connecting to Wi-Fi", WIFI_SSID);
   Serial.println("Connecting to Wi-Fi...");
 }
 
@@ -448,7 +491,7 @@ void loop() {
     startServerIfConnected();
     if (wifiLost) {
       wifiLost = false;
-      showStatus("Servo42C controller", "Wi-Fi connected", "Open in browser:", WiFi.localIP().toString());
+      showStatus(WiFi.localIP().toString());
     }
     if (serverStarted) {
       server.handleClient();
@@ -458,7 +501,7 @@ void loop() {
     lastWifiAttempt = millis();
     wifiLost = true;
     Serial.println("Wi-Fi not connected; retrying.");
-    showStatus("Servo42C controller", "Wi-Fi lost", "Reconnecting...");
+    showStatus("Wi-Fi lost", "Reconnecting...");
     WiFi.reconnect();
   }
 

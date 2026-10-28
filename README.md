@@ -53,10 +53,23 @@ format and 32-bit pulse counts. A wrong protocol can make the driver accept a
 command but move 0 pulses, so check the `UART TX/RX` serial log if a move
 does nothing.
 
+## Python script
+
+[motor.py](motor.py) sends a move to the ESP32 web server (standard library only):
+
+```
+python motor.py forward 10 3200 --host <esp32-ip>
+```
+
+Arguments: `direction` (`forward`/`reverse`), `speed` (1-127), `steps` (1-65535).
+Web credentials are read from `--user`/`--password`, `MOTOR_USER`/`MOTOR_PASSWORD`,
+or `include/wifi_config.h`. `MOTOR_HOST` can replace `--host`.
+
 ## OLED display
 
 A Grove OLED 128x64 (SSD1308, I2C address 0x3C) shows boot, Wi-Fi and IP
-address status, plus the result of the latest move/run/stop command. It uses
+address status, plus the result of the latest move/run/stop command. The last
+row always shows the latest command received over Wi-Fi (e.g. `Cmd: Move 3200 fwd s1`). It uses
 the U8g2 library with its SSD1306 driver, which is compatible.
 
 | ESP32-C3-Zero | Grove OLED |
