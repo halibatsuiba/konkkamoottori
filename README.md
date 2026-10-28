@@ -53,10 +53,27 @@ format and 32-bit pulse counts. A wrong protocol can make the driver accept a
 command but move 0 pulses, so check the `UART TX/RX` serial log if a move
 does nothing.
 
+## OLED display
+
+A Grove OLED 128x64 (SSD1308, I2C address 0x3C) shows boot, Wi-Fi and IP
+address status, plus the result of the latest move/run/stop command. It uses
+the U8g2 library with its SSD1306 driver, which is compatible.
+
+| ESP32-C3-Zero | Grove OLED |
+| --- | --- |
+| GPIO6 | SDA |
+| GPIO7 | SCL |
+| 3V3 | VCC |
+| GND | GND |
+
+Power the display from 3.3 V so the I2C lines stay at ESP32 levels. Change the
+pins with `OLED_SDA_PIN` / `OLED_SCL_PIN` in `include/wifi_config.h`.
+
 ## Firmware settings
 
 The local `include/wifi_config.h` can also override:
 
+- `OLED_SDA_PIN` / `OLED_SCL_PIN` (defaults: GPIO6 / GPIO7)
 - `SERVO_UART_RX_PIN` / `SERVO_UART_TX_PIN` (defaults: GPIO4 / GPIO5)
 - `SERVO_UART_BAUD` (default: 38400)
 - `SERVO_ADDRESS` (default: `0xE0`)
