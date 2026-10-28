@@ -79,24 +79,84 @@ void drawMotorIcon(int x, int y) {
   oled.drawBox(x + 10, y + 4, 4, 3);
 }
 
-// Line 1 is the status line: title, motor icon and Wi-Fi logo. The last row shows the latest Wi-Fi command.
-String lastCommand;
+// Round arrow: clockwise for forward, counter-clockwise for reverse.
+void drawRoundArrow(int centerX, int centerY, bool reverse) {
+  const int radius = 5;
+  const int side = reverse ? -1 : 1;
+  for (int degrees = 0; degrees <= 270; degrees += 6) {
+    const float angle = degrees * PI / 180.0f;
+    oled.drawPixel(centerX + side * lroundf(radius * sinf(angle)), centerY - lroundf(radius * cosf(angle)));
+  }
+  const int tipX = centerX - side * radius;
+  oled.drawTriangle(tipX - 2, centerY, tipX + 2, centerY, tipX, centerY - 4);
+}
 
-void showStatus(const String& line1 = "", const String& line2 = "", const String& line3 = "") {
+// The icon is shown while the encoder value changes. Direction comes from the last move/run command.
+bool motorMoving = false;
+bool motorReverse = false;
+uint32_t lastEncoderPollAt = 0;
+uint32_t lastEncoderChangeAt = 0;
+bool encoderValid = false;
+uint16_t lastEncoderValue = 0;
+bool encoderLogged = false;
+
+// Line 1 is the status line: motor icon, motion arrow and Wi-Fi logo. The last row shows the latest Wi-Fi command.
+String lastCommand;
+String statusLines[3];
+
+// A browser counts as connected while its page keeps polling /ping.
+const uint32_t BROWSER_TIMEOUT_MS = 8000;
+uint32_t lastBrowserSeenAt = 0;
+bool browserShown = false;
+
+bool browserConnected() {
+  return lastBrowserSeenAt != 0 && millis() - lastBrowserSeenAt < BROWSER_TIMEOUT_MS;
+}
+
+// PC icon: monitor with a stand.
+void drawPcIcon(int x, int y) {
+  oled.drawFrame(x, y, 12, 8);
+  oled.drawBox(x + 5, y + 8, 2, 1);
+  oled.drawBox(x + 3, y + 9, 6, 1);
+}
+
+void drawScreen() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
-  oled.drawUTF8(0, 10, "Seponpyöritin");
+  browserShown = browserConnected();
+  if (browserShown) {
+    drawPcIcon(88, 0);
+  }
   if (motorOk) {
-    drawMotorIcon(88, 0);
+    drawMotorIcon(0, 0);
+    if (motorMoving) {
+      drawRoundArrow(26, 5, motorReverse);
+    }
   }
   if (WiFi.status() == WL_CONNECTED) {
     drawWifiLogo(116, 9);
   }
-  const String* lines[] = {&line1, &line2, &line3, &lastCommand};
+  static const String none;
+  const String* lines[] = {&statusLines[0], &statusLines[1], &statusLines[2], motorMoving ? &lastCommand : &none};
   for (int i = 0; i < 4; ++i) {
     oled.drawUTF8(0, 24 + i * 12, lines[i]->c_str());
   }
   oled.sendBuffer();
+}
+
+void showStatus(const String& line1 = "", const String& line2 = "", const String& line3 = "") {
+  statusLines[0] = line1;
+  statusLines[1] = line2;
+  statusLines[2] = line3;
+  drawScreen();
+}
+
+void startMotion(bool reverse) {
+  motorReverse = reverse;
+}
+
+void stopMotion() {
+  motorMoving = false;
 }
 WebServer server(80);
 bool serverStarted = false;
@@ -151,6 +211,9 @@ const char page[] PROGMEM = R"HTML(
     }
     document.querySelector("#run").addEventListener("click", () => send("/run"));
     document.querySelector("#stop").addEventListener("click", () => send("/stop"));
+    const ping = () => fetch("/ping").catch(() => {});
+    ping();
+    setInterval(ping, 3000);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       result.textContent = "Sending command…";
@@ -264,6 +327,69 @@ bool sendServoCommand(uint8_t* command, size_t length, uint8_t& result) {
   return true;
 }
 
+// Reads the encoder (E0 30). The last two reply bytes are the 16-bit value.
+bool readEncoder(uint16_t& value) {
+  while (servoUart.available() > 0) {
+    servoUart.read();
+  }
+  servoUart.write(static_cast<uint8_t>(SERVO_ADDRESS));
+  servoUart.write(static_cast<uint8_t>(0x30));
+  servoUart.flush();
+
+  uint8_t reply[8];
+  size_t received = 0;
+  const uint32_t started = millis();
+  uint32_t lastByteAt = started;
+  while (received < sizeof(reply) && millis() - started < 100) {
+    if (servoUart.available() > 0) {
+      reply[received++] = static_cast<uint8_t>(servoUart.read());
+      lastByteAt = millis();
+    } else if (received >= 2 && millis() - lastByteAt > 10) {
+      break;
+    }
+    delay(1);
+  }
+  if (!encoderLogged) {
+    encoderLogged = true;
+    Serial.print("Encoder reply:");
+    for (size_t i = 0; i < received; ++i) {
+      Serial.printf(" %02X", reply[i]);
+    }
+    Serial.println();
+  }
+  if (received < 2) {
+    return false;
+  }
+  value = static_cast<uint16_t>((reply[received - 2] << 8) | reply[received - 1]);
+  return true;
+}
+
+// Polls the encoder and updates the moving flag; redraws the screen when it changes.
+void updateMotionFromEncoder() {
+  if (!motorOk || millis() - lastEncoderPollAt < 150) {
+    return;
+  }
+  lastEncoderPollAt = millis();
+  uint16_t value = 0;
+  if (!readEncoder(value)) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (encoderValid) {
+    const int16_t delta = static_cast<int16_t>(value - lastEncoderValue);
+    if (abs(delta) > 8) {
+      lastEncoderChangeAt = now;
+    }
+  }
+  encoderValid = true;
+  lastEncoderValue = value;
+  const bool moving = lastEncoderChangeAt != 0 && now - lastEncoderChangeAt < 400;
+  if (moving != motorMoving) {
+    motorMoving = moving;
+    drawScreen();
+  }
+}
+
 bool sendMoveCommand(uint32_t pulses, bool reverse, uint8_t speed, uint8_t& result) {
   uint8_t enable[] = {SERVO_ADDRESS, 0xF3, 0x01, 0};
   uint8_t enableResult = 0;
@@ -335,7 +461,8 @@ void handleMove() {
     return;
   }
 
-  showStatus("Move accepted", WiFi.localIP().toString());
+  startMotion(direction == "reverse");
+  showStatus(WiFi.localIP().toString());
   Serial.printf("Move handled in %lu ms (RSSI %d dBm)\n", static_cast<unsigned long>(millis() - handlerStart),
                 WiFi.RSSI());
   server.send(200, "application/json", "{\"message\":\"Move command accepted by the SERVO42C.\"}");
@@ -355,7 +482,7 @@ void sendServoResult(bool replied, uint8_t result, const char* okMessage, const 
     showStatus(String(action) + " rejected", WiFi.localIP().toString());
     sendJsonError(502, "The SERVO42C rejected the command.");
   } else {
-    showStatus(String(action) + " accepted", WiFi.localIP().toString());
+    showStatus(WiFi.localIP().toString());
     String body = "{\"message\":\"";
     body += okMessage;
     body += "\"}";
@@ -385,6 +512,9 @@ void handleRun() {
   uint8_t result = 0;
   lastCommand = "Cmd: Run " + String(direction == "reverse" ? "rev" : "fwd") + " s" + speed;
   const bool replied = enableServo() && sendServoCommand(command, sizeof(command), result);
+  if (replied && result == 0x01) {
+    startMotion(direction == "reverse");
+  }
   sendServoResult(replied, result, "Running continuously. Press Stop to halt.", "Run");
 }
 
@@ -396,6 +526,9 @@ void handleStop() {
   uint8_t result = 0;
   lastCommand = "Cmd: Stop";
   const bool replied = sendServoCommand(command, sizeof(command), result);
+  if (replied && result == 0x01) {
+    stopMotion();
+  }
   sendServoResult(replied, result, "Stop command accepted by the SERVO42C.", "Stop");
 }
 
@@ -404,6 +537,15 @@ void startServerIfConnected() {
     return;
   }
 
+  server.on("/ping", HTTP_GET, []() {
+    if (requireAuthentication()) {
+      lastBrowserSeenAt = millis();
+      if (!browserShown) {
+        drawScreen();
+      }
+      server.send(200, "text/plain", "ok");
+    }
+  });
   server.on("/", HTTP_GET, []() {
     if (requireAuthentication()) {
       server.send_P(200, "text/html", page);
@@ -482,6 +624,10 @@ void setup() {
 }
 
 void loop() {
+  updateMotionFromEncoder();
+  if (browserShown && !browserConnected()) {
+    drawScreen();
+  }
   if (!hasNetworkSettings()) {
     delay(1000);
     return;
