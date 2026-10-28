@@ -1,0 +1,2 @@
+# konkkamoottori
+Pyoritin multiturn-konkalle
