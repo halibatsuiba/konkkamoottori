@@ -20,6 +20,21 @@ motor's step angle and the driver's subdivision setting.
 The controller uses HTTP Basic Authentication, which is not encrypted. Use
 it only on a trusted local network; do not expose it directly to the Internet.
 
+## Firmware updates over Wi-Fi
+
+Build the `esp32-c3-zero` PlatformIO environment, then open the controller's
+web page and use **Firmware update** to select
+`.pio/build/esp32-c3-zero/firmware.bin`. The page uses the same web credentials
+as the controller interface. The update is rejected while the motor is moving;
+keep the controller powered until it restarts. After the restart, reload the
+page and sign in again if prompted. Use the top menu to switch between Motor
+control and Firmware update. Motor control shows a live log of recent commands
+and detected motion.
+
+The default ESP32 partition table provides two OTA application slots. The
+firmware image must fit in an OTA slot; keep an OTA-capable partition table if
+changing the board's partition configuration.
+
 ## SERVO42C setup and wiring
 
 Before powering or wiring anything, check the pin labels and voltage levels

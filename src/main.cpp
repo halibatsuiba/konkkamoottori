@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Update.h>
 #include <U8g2lib.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -98,7 +99,6 @@ uint32_t lastEncoderPollAt = 0;
 uint32_t lastEncoderChangeAt = 0;
 bool encoderValid = false;
 uint16_t lastEncoderValue = 0;
-bool encoderLogged = false;
 
 // Line 1 is the status line: motor icon, motion arrow and Wi-Fi logo. The last row shows the latest Wi-Fi command.
 String lastCommand;
@@ -160,9 +160,31 @@ void stopMotion() {
 }
 WebServer server(80);
 bool serverStarted = false;
+bool firmwareUpdateStarted = false;
+bool firmwareUpdateFailed = false;
+bool firmwareUpdateComplete = false;
+int firmwareUpdateStatusCode = 500;
+String firmwareUpdateError;
+const size_t MOTOR_LOG_CAPACITY = 20;
+String motorLogEntries[MOTOR_LOG_CAPACITY];
+size_t motorLogNext = 0;
+size_t motorLogCount = 0;
 uint32_t lastWifiAttempt = 0;
 bool wifiLost = false;
-String i2cScanResult;
+
+void addMotorLog(const String& message) {
+  const uint32_t seconds = millis() / 1000;
+  char timestamp[16];
+  snprintf(timestamp, sizeof(timestamp), "%02lu:%02lu:%02lu",
+           static_cast<unsigned long>(seconds / 3600),
+           static_cast<unsigned long>((seconds / 60) % 60),
+           static_cast<unsigned long>(seconds % 60));
+  motorLogEntries[motorLogNext] = String("[") + timestamp + "] " + message;
+  motorLogNext = (motorLogNext + 1) % MOTOR_LOG_CAPACITY;
+  if (motorLogCount < MOTOR_LOG_CAPACITY) {
+    ++motorLogCount;
+  }
+}
 
 const char page[] PROGMEM = R"HTML(
 <!doctype html>
@@ -170,35 +192,94 @@ const char page[] PROGMEM = R"HTML(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Servo42C controller</title>
+  <title>Seponpyöritin</title>
   <style>
     body{font:16px system-ui,sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem}
     label{display:block;margin:1rem 0 .35rem}
     input,select,button{box-sizing:border-box;font:inherit;padding:.65rem;width:100%}
     button{margin-top:1.2rem}
+    nav{display:flex;align-items:center;gap:.75rem;border-bottom:1px solid #ccc;padding-bottom:.75rem}
+    nav label{margin:0}
+    nav select{width:auto;flex:1}
+    section{margin-top:1.5rem}
+    #motor-log{box-sizing:border-box;width:100%;height:14rem;overflow:auto;background:#111;color:#eee;padding:.75rem;white-space:pre-wrap}
+    #update-progress{display:block;width:100%;margin-top:1rem}
     #result{white-space:pre-wrap}
   </style>
 </head>
 <body>
-  <h1>Servo42C controller</h1>
-  <form id="move-form">
-    <label for="pulses">Move pulse count</label>
-    <input id="pulses" name="pulses" type="number" min="1" required>
-    <label for="direction">Direction</label>
-    <select id="direction" name="direction">
-      <option value="forward">Forward</option>
-      <option value="reverse">Reverse</option>
+  <h1>Seponpyöritin</h1>
+  <nav aria-label="Main menu">
+    <label for="page-select">Menu</label>
+    <select id="page-select">
+      <option value="motor-page">Motor control</option>
+      <option value="firmware-page">Firmware update</option>
     </select>
-    <label for="speed">Speed (1–127)</label>
-    <input id="speed" name="speed" type="number" min="1" max="127" value="16" required>
-    <button type="submit">Move</button>
-    <button type="button" id="run">Run continuously (test)</button>
-    <button type="button" id="stop">Stop</button>
-  </form>
-  <p id="result" role="status"></p>
+  </nav>
+  <section id="motor-page">
+    <h2>Motor control</h2>
+    <form id="move-form">
+      <label for="pulses">Move pulse count</label>
+      <input id="pulses" name="pulses" type="number" min="1" required>
+      <label for="direction">Direction</label>
+      <select id="direction" name="direction">
+        <option value="forward">Forward</option>
+        <option value="reverse">Reverse</option>
+      </select>
+      <label for="speed">Speed (1–127)</label>
+      <input id="speed" name="speed" type="number" min="1" max="127" value="16" required>
+      <button type="submit">Move</button>
+      <button type="button" id="run">Run continuously (test)</button>
+      <button type="button" id="stop">Stop</button>
+    </form>
+    <p id="result" role="status"></p>
+    <h3>Live log</h3>
+    <pre id="motor-log" role="log" aria-live="polite">Waiting for motor activity…</pre>
+  </section>
+  <section id="firmware-page" hidden>
+    <h2>Firmware update</h2>
+    <p>Select a firmware .bin file built for this controller. Keep the controller powered while it updates.</p>
+    <form id="update-form">
+      <label for="firmware">Firmware file</label>
+      <input id="firmware" name="firmware" type="file" accept=".bin,application/octet-stream" required>
+      <button id="update-button" type="submit">Upload firmware</button>
+    </form>
+    <progress id="update-progress" max="100" value="0" hidden></progress>
+    <p id="update-progress-label" aria-live="polite"></p>
+    <p id="update-result" role="status"></p>
+  </section>
   <script>
     const form = document.querySelector("#move-form");
     const result = document.querySelector("#result");
+    const updateForm = document.querySelector("#update-form");
+    const updateResult = document.querySelector("#update-result");
+    const updateButton = document.querySelector("#update-button");
+    const updateProgress = document.querySelector("#update-progress");
+    const updateProgressLabel = document.querySelector("#update-progress-label");
+    const pageSelect = document.querySelector("#page-select");
+    const motorPage = document.querySelector("#motor-page");
+    const firmwarePage = document.querySelector("#firmware-page");
+    const motorLog = document.querySelector("#motor-log");
+    function showSelectedPage() {
+      const showMotor = pageSelect.value === "motor-page";
+      motorPage.hidden = !showMotor;
+      firmwarePage.hidden = showMotor;
+      if (showMotor) refreshMotorLog();
+    }
+    pageSelect.addEventListener("change", showSelectedPage);
+    async function refreshMotorLog() {
+      if (motorPage.hidden) return;
+      try {
+        const response = await fetch("/log", {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const entries = await response.text();
+        const wasAtBottom = motorLog.scrollHeight - motorLog.scrollTop - motorLog.clientHeight < 24;
+        motorLog.textContent = entries || "No motor activity yet.";
+        if (wasAtBottom) motorLog.scrollTop = motorLog.scrollHeight;
+      } catch {
+        motorLog.textContent = "Live log unavailable. Check the Wi-Fi connection and reload.";
+      }
+    }
     async function send(path) {
       result.textContent = "Sending command…";
       try {
@@ -211,9 +292,61 @@ const char page[] PROGMEM = R"HTML(
     }
     document.querySelector("#run").addEventListener("click", () => send("/run"));
     document.querySelector("#stop").addEventListener("click", () => send("/stop"));
+    updateForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      updateButton.disabled = true;
+      updateProgress.hidden = false;
+      updateProgress.value = 0;
+      updateProgressLabel.textContent = "Uploading: 0%";
+      updateResult.textContent = "Uploading firmware…";
+      const request = new XMLHttpRequest();
+      request.upload.addEventListener("progress", (progressEvent) => {
+        if (!progressEvent.lengthComputable) {
+          updateProgress.removeAttribute("value");
+          updateProgressLabel.textContent = "Uploading firmware…";
+          return;
+        }
+        const percent = Math.round(progressEvent.loaded * 100 / progressEvent.total);
+        updateProgress.value = percent;
+        updateProgressLabel.textContent = `Uploading: ${percent}%`;
+      });
+      request.upload.addEventListener("load", () => {
+        updateProgress.value = 100;
+        updateProgressLabel.textContent = "Upload complete. Installing firmware…";
+        updateResult.textContent = "Keep the controller powered while the firmware is installed.";
+      });
+      request.addEventListener("load", () => {
+        let data;
+        try {
+          data = JSON.parse(request.responseText);
+        } catch {
+          updateResult.textContent = "Upload failed. Check the connection and try again.";
+          updateButton.disabled = false;
+          updateProgressLabel.textContent = "Update failed.";
+          return;
+        }
+        if (request.status >= 200 && request.status < 300) {
+          updateProgressLabel.textContent = "Update complete. Controller restarting…";
+          updateResult.textContent = `${data.message} Reconnect after the controller restarts.`;
+        } else {
+          updateResult.textContent = `Error: ${data.error || "Firmware update failed."}`;
+          updateButton.disabled = false;
+          updateProgressLabel.textContent = "Update failed.";
+        }
+      });
+      request.addEventListener("error", () => {
+        updateResult.textContent = "Upload failed or the controller restarted. Check the connection before retrying.";
+        updateButton.disabled = false;
+        updateProgressLabel.textContent = "Update failed.";
+      });
+      request.open("POST", "/update");
+      request.send(new FormData(updateForm));
+    });
     const ping = () => fetch("/ping").catch(() => {});
     ping();
     setInterval(ping, 3000);
+    refreshMotorLog();
+    setInterval(refreshMotorLog, 1000);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       result.textContent = "Sending command…";
@@ -274,12 +407,8 @@ uint8_t checksum(const uint8_t* bytes, size_t length) {
 }
 
 bool sendServoCommand(uint8_t* command, size_t length, uint8_t& result) {
-  if (servoUart.available() > 0) {
-    Serial.print("UART stale RX:");
-    while (servoUart.available() > 0) {
-      Serial.printf(" %02X", servoUart.read());
-    }
-    Serial.println();
+  while (servoUart.available() > 0) {
+    servoUart.read();
   }
 
   // The last array byte is a checksum slot; V1.0 firmware has no checksum, so it is not sent.
@@ -304,19 +433,6 @@ bool sendServoCommand(uint8_t* command, size_t length, uint8_t& result) {
     }
     delay(1);
   }
-
-  Serial.print("UART TX:");
-  for (size_t i = 0; i < length; ++i) {
-    Serial.printf(" %02X", command[i]);
-  }
-  Serial.print(" | RX:");
-  if (received == 0) {
-    Serial.print(" (nothing)");
-  }
-  for (size_t i = 0; i < received; ++i) {
-    Serial.printf(" %02X", response[i]);
-  }
-  Serial.println();
 
   if (received < 2 || response[0] != SERVO_ADDRESS ||
       (SERVO_HAS_CHECKSUM && received == 3 && response[2] != checksum(response, 2))) {
@@ -349,14 +465,6 @@ bool readEncoder(uint16_t& value) {
     }
     delay(1);
   }
-  if (!encoderLogged) {
-    encoderLogged = true;
-    Serial.print("Encoder reply:");
-    for (size_t i = 0; i < received; ++i) {
-      Serial.printf(" %02X", reply[i]);
-    }
-    Serial.println();
-  }
   if (received < 2) {
     return false;
   }
@@ -386,6 +494,7 @@ void updateMotionFromEncoder() {
   const bool moving = lastEncoderChangeAt != 0 && now - lastEncoderChangeAt < 400;
   if (moving != motorMoving) {
     motorMoving = moving;
+    addMotorLog(moving ? "Motor motion detected." : "Motor stopped.");
     drawScreen();
   }
 }
@@ -422,7 +531,6 @@ bool sendMoveCommand(uint32_t pulses, bool reverse, uint8_t speed, uint8_t& resu
 }
 
 void handleMove() {
-  const uint32_t handlerStart = millis();
   if (!requireAuthentication()) {
     return;
   }
@@ -452,19 +560,21 @@ void handleMove() {
   lastCommand = "Cmd: Move " + String(pulses) + (direction == "reverse" ? " rev" : " fwd") + " s" + speed;
   if (!sendMoveCommand(pulses, direction == "reverse", static_cast<uint8_t>(speed), motorResult)) {
     showStatus("Move failed: no reply", WiFi.localIP().toString());
+    addMotorLog("Move failed: no valid response from the SERVO42C.");
     sendJsonError(502, "No valid response from the SERVO42C. Check UART wiring, baud rate, address, and CR_UART mode.");
     return;
   }
   if (motorResult != 0x01) {
     showStatus("Move rejected", WiFi.localIP().toString());
+    addMotorLog("Move rejected by the SERVO42C.");
     sendJsonError(502, "The SERVO42C rejected the move command.");
     return;
   }
 
   startMotion(direction == "reverse");
+  addMotorLog("Move accepted: " + String(pulses) + " pulses " +
+              (direction == "reverse" ? "reverse" : "forward") + ", speed " + String(speed) + ".");
   showStatus(WiFi.localIP().toString());
-  Serial.printf("Move handled in %lu ms (RSSI %d dBm)\n", static_cast<unsigned long>(millis() - handlerStart),
-                WiFi.RSSI());
   server.send(200, "application/json", "{\"message\":\"Move command accepted by the SERVO42C.\"}");
 }
 
@@ -477,12 +587,15 @@ bool enableServo() {
 void sendServoResult(bool replied, uint8_t result, const char* okMessage, const char* action) {
   if (!replied) {
     showStatus(String(action) + " failed: no reply", WiFi.localIP().toString());
+    addMotorLog(String(action) + " failed: no valid response from the SERVO42C.");
     sendJsonError(502, "No valid response from the SERVO42C. Check UART wiring, baud rate, address, and CR_UART mode.");
   } else if (result != 0x01) {
     showStatus(String(action) + " rejected", WiFi.localIP().toString());
+    addMotorLog(String(action) + " rejected by the SERVO42C.");
     sendJsonError(502, "The SERVO42C rejected the command.");
   } else {
     showStatus(WiFi.localIP().toString());
+    addMotorLog(String(action) + " command accepted by the SERVO42C.");
     String body = "{\"message\":\"";
     body += okMessage;
     body += "\"}";
@@ -532,6 +645,80 @@ void handleStop() {
   sendServoResult(replied, result, "Stop command accepted by the SERVO42C.", "Stop");
 }
 
+void failFirmwareUpdate(const char* message, int statusCode = 500) {
+  firmwareUpdateFailed = true;
+  firmwareUpdateStatusCode = statusCode;
+  firmwareUpdateError = message;
+  if (firmwareUpdateStarted) {
+    Update.abort();
+    firmwareUpdateStarted = false;
+  }
+  addMotorLog(String("Firmware update failed: ") + firmwareUpdateError);
+}
+
+void handleFirmwareUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    firmwareUpdateStarted = false;
+    firmwareUpdateFailed = false;
+    firmwareUpdateComplete = false;
+    firmwareUpdateStatusCode = 500;
+    firmwareUpdateError = "";
+    if (!server.authenticate(WEB_AUTH_USER, WEB_AUTH_PASSWORD)) {
+      firmwareUpdateFailed = true;
+      return;
+    }
+    if (motorMoving) {
+      failFirmwareUpdate("Stop the motor before updating firmware.", 409);
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      failFirmwareUpdate(Update.errorString());
+      return;
+    }
+    firmwareUpdateStarted = true;
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (firmwareUpdateStarted && !firmwareUpdateFailed &&
+        Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      failFirmwareUpdate(Update.errorString());
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (firmwareUpdateStarted && !firmwareUpdateFailed) {
+      if (!Update.end(true)) {
+        failFirmwareUpdate(Update.errorString());
+      } else {
+        firmwareUpdateStarted = false;
+        firmwareUpdateComplete = true;
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    failFirmwareUpdate("Firmware upload was interrupted.");
+  }
+}
+
+void handleFirmwareUpdateResult() {
+  if (!requireAuthentication()) {
+    return;
+  }
+  if (firmwareUpdateFailed) {
+    if (firmwareUpdateStatusCode == 409) {
+      sendJsonError(409, "Stop the motor before updating firmware.");
+    } else {
+      sendJsonError(500, "Firmware update failed. Check the serial log.");
+    }
+    return;
+  }
+  if (!firmwareUpdateComplete) {
+    sendJsonError(400, "No firmware file was uploaded.");
+    return;
+  }
+
+  addMotorLog("Firmware update complete; restarting.");
+  server.send(200, "application/json", "{\"message\":\"Firmware installed.\"}");
+  delay(250);
+  ESP.restart();
+}
+
 void startServerIfConnected() {
   if (serverStarted || WiFi.status() != WL_CONNECTED) {
     return;
@@ -546,6 +733,19 @@ void startServerIfConnected() {
       server.send(200, "text/plain", "ok");
     }
   });
+  server.on("/log", HTTP_GET, []() {
+    if (!requireAuthentication()) {
+      return;
+    }
+    String body;
+    for (size_t i = 0; i < motorLogCount; ++i) {
+      const size_t index = (motorLogNext + MOTOR_LOG_CAPACITY - motorLogCount + i) % MOTOR_LOG_CAPACITY;
+      body += motorLogEntries[index];
+      body += '\n';
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/plain", body);
+  });
   server.on("/", HTTP_GET, []() {
     if (requireAuthentication()) {
       server.send_P(200, "text/html", page);
@@ -554,6 +754,7 @@ void startServerIfConnected() {
   server.on("/move", HTTP_POST, handleMove);
   server.on("/run", HTTP_POST, handleRun);
   server.on("/stop", HTTP_POST, handleStop);
+  server.on("/update", HTTP_POST, handleFirmwareUpdateResult, handleFirmwareUpdateUpload);
   server.onNotFound([]() {
     if (requireAuthentication()) {
       sendJsonError(404, "Not found.");
@@ -561,38 +762,15 @@ void startServerIfConnected() {
   });
   server.begin();
   serverStarted = true;
-  Serial.println(i2cScanResult);
-  Serial.print("Connected. Controller ready at http://");
+  addMotorLog("Controller connected to Wi-Fi.");
   showStatus(WiFi.localIP().toString());
-  Serial.println(i2cScanResult);
 }
 
 }  // namespace
 
 void setup() {
-  Serial.begin(115200);
-  // Without a terminal attached, USB CDC writes would block; drop the output instead.
-  Serial.setTxTimeoutMs(0);
-  const uint32_t serialWaitStart = millis();
-  while (!Serial && millis() - serialWaitStart < 3000) {
-    delay(10);
-  }
-  Serial.println("Booting SERVO42C controller...");
   servoUart.begin(SERVO_UART_BAUD, SERIAL_8N1, SERVO_UART_RX_PIN, SERVO_UART_TX_PIN);
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
-  i2cScanResult = "I2C scan (SDA=GPIO" + String(OLED_SDA_PIN) + ", SCL=GPIO" + String(OLED_SCL_PIN) + "):";
-  bool anyI2c = false;
-  for (uint8_t address = 1; address < 127; ++address) {
-    Wire.beginTransmission(address);
-    if (Wire.endTransmission() == 0) {
-      i2cScanResult += " 0x" + String(address, HEX);
-      anyI2c = true;
-    }
-  }
-  if (!anyI2c) {
-    i2cScanResult += " no devices found";
-  }
-  Serial.println(i2cScanResult);
   oled.setI2CAddress(0x3C << 1);
   oled.begin();
   showStatus("Booting...");
@@ -601,26 +779,19 @@ void setup() {
   uint8_t statusCommand[] = {SERVO_ADDRESS, 0x3A, 0};
   uint8_t statusResult = 0;
   motorOk = sendServoCommand(statusCommand, sizeof(statusCommand), statusResult);
-  Serial.println(motorOk ? "Motor: OK" : "Motor: Error");
   showStatus("Booting...");
 
   if (!hasNetworkSettings()) {
     showStatus("No Wi-Fi settings", "Edit wifi_config.h");
-    Serial.println("Wi-Fi/controller credentials are not configured.");
-    Serial.println("Copy include/wifi_config.example.h to include/wifi_config.h and set all four values.");
     return;
   }
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
-    Serial.printf("Wi-Fi disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
-  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWifiAttempt = millis();
   showStatus("Connecting to Wi-Fi", WIFI_SSID);
-  Serial.println("Connecting to Wi-Fi...");
 }
 
 void loop() {
@@ -646,7 +817,6 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED && (millis() - lastWifiAttempt >= 15000)) {
     lastWifiAttempt = millis();
     wifiLost = true;
-    Serial.println("Wi-Fi not connected; retrying.");
     showStatus("Wi-Fi lost", "Reconnecting...");
     WiFi.reconnect();
   }
